@@ -6,7 +6,7 @@ Attach to your training loop for comprehensive monitoring.
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 
 import numpy as np
 import torch
@@ -48,12 +48,25 @@ class ActivationMonitor:
         def hook_fn(module, inp, output):
             with torch.no_grad():
                 act = output.detach().float()
-                self.stats[name] = {
-                    'mean': act.mean().item(),
-                    'std': act.std().item(),
-                    'dead_pct': (act.abs() < 1e-8).float().mean().item() * 100,
-                    'max_abs': act.abs().max().item(),
-                }
+                if torch.isnan(act).any():
+                    logger.critical(f"NaN DETECTED in layer: {name} activations!")
+                if torch.isinf(act).any():
+                    logger.critical(f"Inf DETECTED in layer: {name} activations!")
+
+                m, s = act.mean().item(), act.std().item()
+                dead = (act.abs() < 1e-8).float().mean().item() * 100
+                mx = act.abs().max().item()
+
+                if name not in self.stats:
+                    self.stats[name] = {'mean': m, 'std': s, 'dead_pct': dead, 'max_abs': mx, 'n': 1}
+                else:
+                    st = self.stats[name]
+                    n = st['n']
+                    st['mean'] = (st['mean'] * n + m) / (n + 1)
+                    st['std'] = (st['std'] * n + s) / (n + 1)
+                    st['dead_pct'] = (st['dead_pct'] * n + dead) / (n + 1)
+                    st['max_abs'] = max(st['max_abs'], mx)
+                    st['n'] = n + 1
         return hook_fn
 
     def remove(self):
@@ -140,13 +153,17 @@ class TrainingMonitor:
         monitor.save_summary()
     """
 
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str, detect_anomalies: bool = False):
         self.diag_dir = Path(output_dir) / 'diagnostics'
         self.diag_dir.mkdir(parents=True, exist_ok=True)
         self.overfit_detector = OverfitDetector()
         self._weight_snapshot = None
         self._update_ratios = {}
         self._all_epoch_data: List[Dict] = []
+        self.detect_anomalies = detect_anomalies
+        if self.detect_anomalies:
+            torch.autograd.set_detect_anomaly(True)
+            logger.warning("Anomaly detection ENABLED. Training will be slower.")
 
     def run_sanity_checks(self, model, loader, criterion, optimizer, device, n_classes=None):
         """Run pre-training sanity checks. Call before epoch 0."""
@@ -183,7 +200,9 @@ class TrainingMonitor:
         val_loss: float,
         train_acc: float,
         val_acc: float,
-        learning_rate: float,
+        learning_rate: Union[float, Dict[str, float]],
+        data_time: float = 0.0,
+        compute_time: float = 0.0,
         class_names: Optional[Dict[int, str]] = None,
         full_diagnostics: bool = False,
     ) -> Dict[str, Any]:
@@ -196,6 +215,7 @@ class TrainingMonitor:
         """
         n_classes = val_probs.shape[1] if val_probs.ndim == 2 else 2
         val_preds = val_probs.argmax(axis=1)
+        val_targets = np.asarray(val_targets).flatten()
 
         if class_names is None:
             class_names = {i: f'class_{i}' for i in range(n_classes)}
@@ -258,9 +278,19 @@ class TrainingMonitor:
                     'effective_rank_ratio_min': round(float(np.min(ratios)), 4),
                 }
 
+        # Performance/System (Memory and Time)
+        gpu_mem_alloc_mb = float(torch.cuda.memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else 0.0
+        gpu_max_mem_alloc_mb = float(torch.cuda.max_memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else 0.0
+
         # Build diagnostics dict
         diag = {
             'epoch': epoch,
+            'performance': {
+                'data_time': round(data_time, 4),
+                'compute_time': round(compute_time, 4),
+                'gpu_mem_alloc_mb': round(gpu_mem_alloc_mb, 2),
+                'gpu_max_mem_alloc_mb': round(gpu_max_mem_alloc_mb, 2),
+            },
             'losses': {
                 'train_loss': round(train_loss, 6),
                 'val_loss': round(val_loss, 6),
@@ -284,7 +314,7 @@ class TrainingMonitor:
             'update_ratios': ur_summary,
             'stability': temporal,
             'spectral': spectral,
-            'learning_rate': learning_rate,
+            'learning_rates': learning_rate,
             'alerts': overfit_alerts,
         }
 
@@ -336,6 +366,8 @@ class TrainingMonitor:
             'entropy_mean': [_get(d, 'calibration', 'prediction_entropy_mean') for d in self._all_epoch_data],
             'confidence_gap': [_get(d, 'calibration', 'gap') for d in self._all_epoch_data],
             'update_ratio_mean': [_get(d, 'update_ratios', 'mean') for d in self._all_epoch_data],
+            'gpu_max_mem_mb_mean': float(np.mean([_get(d, 'performance', 'gpu_max_mem_alloc_mb') for d in self._all_epoch_data])) if self._all_epoch_data and 'performance' in self._all_epoch_data[0] else 0.0,
+            'compute_time_mean': float(np.mean([_get(d, 'performance', 'compute_time') for d in self._all_epoch_data])) if self._all_epoch_data and 'performance' in self._all_epoch_data[0] else 0.0,
         }
 
         with open(self.diag_dir / 'training_summary.json', 'w') as f:

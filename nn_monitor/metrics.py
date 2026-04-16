@@ -26,6 +26,8 @@ def collect_weight_stats(model: nn.Module) -> Dict[str, Dict[str, float]]:
         if 'weight' not in name or param.dim() < 2:
             continue
         w = param.data.float()
+        if torch.isnan(w).any() or torch.isinf(w).any():
+            w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
         stats[name] = {
             'mean': w.mean().item(),
             'std': w.std().item(),
@@ -80,7 +82,10 @@ def collect_gradient_stats(model: nn.Module) -> Dict[str, float]:
     grad_norms = []
     for name, param in model.named_parameters():
         if param.grad is not None:
-            grad_norms.append(param.grad.data.norm(2).item())
+            g = param.grad.data
+            if torch.isnan(g).any() or torch.isinf(g).any():
+                g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+            grad_norms.append(g.norm(2).item())
 
     if not grad_norms:
         return {}
@@ -194,6 +199,8 @@ def effective_rank(weight: torch.Tensor) -> float:
     if weight.dim() < 2:
         return float(weight.numel())
     W = weight.detach().float().cpu()
+    if W.dim() > 2:
+        W = W.view(W.shape[0], -1)
     try:
         S = torch.linalg.svdvals(W)
     except Exception:
@@ -259,4 +266,83 @@ def prediction_stability_noise(
     return {
         'mean_flip_rate': round(float(np.mean(flip_rates)), 4),
         'noise_std': noise_std,
+    }
+
+
+# ─────────────────────────────────────────────
+#  Time-Series & Structural Specific
+# ─────────────────────────────────────────────
+
+def compute_psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> Dict[str, float]:
+    """Population Stability Index (PSI) to detect feature drift (Covariate Shift).
+    
+    Useful for LightGBM, HMM, or any model handling structured/timeseries data 
+    where the distribution might shift between training (expected) and inference (actual).
+    
+    Interpretation:
+        PSI < 0.1: No significant drift (safe).
+        PSI 0.1 - 0.2: Moderate drift (monitor closely).
+        PSI > 0.2: Significant shift (retraining advised).
+    """
+    expected_flat = np.asarray(expected).flatten()
+    actual_flat = np.asarray(actual).flatten()
+    
+    if len(expected_flat) == 0 or len(actual_flat) == 0:
+        return {'psi_total': 0.0, 'drift_detected': False}
+
+    breakpoints = np.percentile(expected_flat, np.linspace(0, 100, n_bins + 1))
+    breakpoints = np.unique(breakpoints)
+    if len(breakpoints) < 2:
+        return {'psi_total': 0.0, 'drift_detected': False}
+        
+    breakpoints[0] = -np.inf
+    breakpoints[-1] = np.inf
+
+    expected_counts, _ = np.histogram(expected_flat, bins=breakpoints)
+    actual_counts, _ = np.histogram(actual_flat, bins=breakpoints)
+
+    expected_perc = np.maximum(expected_counts / len(expected_flat), 1e-4)
+    actual_perc = np.maximum(actual_counts / len(actual_flat), 1e-4)
+
+    psi_values = (actual_perc - expected_perc) * np.log(actual_perc / expected_perc)
+    total_psi = float(np.sum(psi_values))
+
+    return {
+        'psi_total': round(total_psi, 4),
+        'drift_detected': total_psi > 0.1,
+        'bins_used': len(breakpoints) - 1,
+    }
+
+
+def compute_attention_entropy(attention_weights: torch.Tensor) -> Dict[str, float]:
+    """Shannon entropy of attention head distributions.
+    
+    Detects if self-attention mechanism collapses (focusing solely on 1 token) 
+    or becomes uniform (focusing on all tokens equally).
+    
+    Args:
+        attention_weights: (B, num_heads, seq_len, seq_len) or (seq_len, seq_len)
+    
+    Interpretation:
+        normalized_entropy ~ 0.0: Collasped attention (attending to a single token)
+        normalized_entropy ~ 1.0: Uniform attention (uninformative mapping) 
+    """
+    if attention_weights.dim() < 2:
+        return {}
+    
+    seq_len = attention_weights.shape[-1]
+    if seq_len <= 1:
+        return {'normalized_mean': 1.0}
+        
+    eps = 1e-8
+    A = attention_weights.detach().float().cpu()
+    
+    entropy = -(A * torch.log(A + eps)).sum(dim=-1)
+    max_entropy = float(np.log(seq_len))
+    avg_entropy = float(entropy.mean())
+    
+    return {
+        'entropy_mean': round(avg_entropy, 4),
+        'max_possible': round(max_entropy, 4),
+        'normalized_mean': round(avg_entropy / max_entropy, 4) if max_entropy > 0 else 0.0,
     }

@@ -44,10 +44,10 @@ def check_loss_at_init(model, loader, criterion, device, n_classes=None) -> Dict
         loss = criterion(outputs, targets).item()
 
         if n_classes is None:
-            if outputs.dim() == 2:
+            if outputs.dim() >= 2:
                 n_classes = outputs.shape[1]
             else:
-                n_classes = len(torch.unique(targets))
+                n_classes = 2 # Best guess for 1D output (e.g. BCELoss)
 
     expected = -np.log(1.0 / n_classes)
     deviation = abs(loss - expected) / expected
@@ -161,4 +161,75 @@ def verify_gradient_flow(model) -> Dict[str, Any]:
         logger.warning(f"Gradient flow broken: {len(no_grad)} layers with no grad, {len(zero_grad)} with zero grad")
     else:
         logger.info(f"Gradient flow OK: all {len(healthy)} layers receiving gradients")
+    return result
+
+
+def check_receptive_field_gradients(model, loader, criterion, device) -> Dict[str, Any]:
+    """Check if gradients reach the entire historical receptive window.
+    
+    Specially designed for TCN and Transformers on Time Series. 
+    Verifies that the loss derivatives wrt the inputs do not vanish for old time steps.
+    """
+    model.train()
+    
+    batch = next(iter(loader))
+    if isinstance(batch, (list, tuple)):
+        # Assume input format where L is sequence length
+        features = batch[0].clone().detach().to(device)
+        targets = batch[-1].to(device)
+        extras = batch[1].to(device) if len(batch) == 3 else None
+    else:
+        raise ValueError("Loader must yield tuples")
+        
+    features.requires_grad_(True)
+    model.zero_grad()
+    
+    try:
+        outputs = model(features, global_features=extras) if extras is not None else model(features)
+    except TypeError:
+        outputs = model(features)
+        
+    loss = criterion(outputs, targets)
+    loss.backward()
+    
+    if features.grad is None:
+        logger.warning("Features have no gradient. Receptive field test failed.")
+        return {'ok': False, 'msg': "Features received no gradients"}
+        
+    # Assume time axis is the last or second to last. Let's flatten all but the last dimension.
+    # TCN/Transformer usually have (N, C, L) or (N, L, C). We'll assume the time axis is the one with length L > features.shape[1] or similar.
+    # To be safe and architecture agnostic, we'll just take the gradient norm over the batch and channel features.
+    
+    # If the format is (N, C, L), dim=2 is L
+    # If the format is (N, L, C), dim=1 is L
+    if features.dim() < 3:
+        return {'ok': True, 'msg': "Input is not 3D, skipping receptive field test."}
+        
+    time_dim = 2 if features.shape[2] > features.shape[1] else 1 
+    other_dims = [i for i in range(features.dim()) if i != time_dim]
+    
+    grad = features.grad.abs().mean(dim=other_dims)
+    L = grad.shape[0]
+    
+    if L < 2:
+        return {'ok': True, 'msg': "Sequence length < 2, test not applicable"}
+        
+    oldest_grad = grad[0].item()
+    newest_grad = grad[-1].item()
+    
+    vanished_history = oldest_grad < 1e-8
+    
+    result = {
+        'ok': not vanished_history,
+        'oldest_token_grad': oldest_grad,
+        'newest_token_grad': newest_grad,
+        'decay_ratio': oldest_grad / (newest_grad + 1e-8), 
+        'sequence_length': L
+    }
+    
+    if vanished_history:
+        logger.warning(f"Receptive Field Collapse: gradient for oldest token is {oldest_grad:.2e}")
+    else:
+        logger.info(f"Receptive Field OK: gradient for oldest token is {oldest_grad:.2e}")
+        
     return result
