@@ -26,66 +26,148 @@ from .plots import (
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_LAYER_TYPES = (
+    nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d,
+    nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d,
+    nn.ReLU, nn.GELU, nn.SiLU, nn.Tanh,
+)
+
+
 class ActivationMonitor:
-    """Attach forward hooks to track activation statistics and dead neurons.
+    """Forward-hook activation tracker with Welford online stats.
+
+    Correctly aggregates mean/var across batches (simple averaging of
+    per-batch stds is biased — Jensen's inequality). Emits CRITICAL logs
+    on first NaN/Inf occurrence per layer, not every batch.
 
     Usage:
-        monitor = ActivationMonitor(model)
-        model(some_input)  # triggers hooks
-        stats = monitor.summary()
-        monitor.remove()  # always remove when done
+        with ActivationMonitor(model) as mon:
+            model(x)
+            stats = mon.summary()
+        # hooks auto-removed on __exit__
+
+    Or manually:
+        mon = ActivationMonitor(model)
+        try:
+            model(x)
+            stats = mon.summary()
+        finally:
+            mon.remove()
+
+    Call `.reset()` between epochs to avoid stale averaging.
     """
 
-    def __init__(self, model: nn.Module, layer_types=(nn.Linear, nn.Conv1d)):
+    def __init__(self, model: nn.Module, layer_types=None, dead_threshold: float = 1e-8):
+        self.layer_types = layer_types if layer_types is not None else _DEFAULT_LAYER_TYPES
+        self.dead_threshold = dead_threshold
         self.stats: Dict[str, Dict[str, float]] = {}
+        self._nan_seen: set = set()
+        self._inf_seen: set = set()
         self._hooks = []
         for name, module in model.named_modules():
-            if isinstance(module, layer_types):
+            if isinstance(module, self.layer_types):
                 hook = module.register_forward_hook(self._make_hook(name))
                 self._hooks.append(hook)
 
     def _make_hook(self, name: str):
         def hook_fn(module, inp, output):
+            out = output[0] if isinstance(output, (tuple, list)) else output
+            if not torch.is_tensor(out):
+                return
             with torch.no_grad():
-                act = output.detach().float()
-                if torch.isnan(act).any():
-                    logger.critical(f"NaN DETECTED in layer: {name} activations!")
-                if torch.isinf(act).any():
-                    logger.critical(f"Inf DETECTED in layer: {name} activations!")
+                act = out.detach().float()
+                has_nan = bool(torch.isnan(act).any().item())
+                has_inf = bool(torch.isinf(act).any().item())
+                if has_nan and name not in self._nan_seen:
+                    self._nan_seen.add(name)
+                    logger.critical(f"NaN in activations — layer: {name}")
+                if has_inf and name not in self._inf_seen:
+                    self._inf_seen.add(name)
+                    logger.critical(f"Inf in activations — layer: {name}")
+                if has_nan or has_inf:
+                    act = torch.nan_to_num(act, nan=0.0, posinf=0.0, neginf=0.0)
 
-                m, s = act.mean().item(), act.std().item()
-                dead = (act.abs() < 1e-8).float().mean().item() * 100
-                mx = act.abs().max().item()
+                count = act.numel()
+                mean_b = float(act.mean().item())
+                var_b = float(act.var(unbiased=False).item())
+                dead_pct = float((act.abs() < self.dead_threshold).float().mean().item() * 100)
+                max_abs = float(act.abs().max().item())
 
-                if name not in self.stats:
-                    self.stats[name] = {'mean': m, 'std': s, 'dead_pct': dead, 'max_abs': mx, 'n': 1}
+                st = self.stats.get(name)
+                if st is None:
+                    self.stats[name] = {
+                        'count': count, 'mean': mean_b, 'M2': var_b * count,
+                        'dead_pct_sum': dead_pct, 'max_abs': max_abs,
+                        'n_batches': 1, 'nan': has_nan, 'inf': has_inf,
+                    }
                 else:
-                    st = self.stats[name]
-                    n = st['n']
-                    st['mean'] = (st['mean'] * n + m) / (n + 1)
-                    st['std'] = (st['std'] * n + s) / (n + 1)
-                    st['dead_pct'] = (st['dead_pct'] * n + dead) / (n + 1)
-                    st['max_abs'] = max(st['max_abs'], mx)
-                    st['n'] = n + 1
+                    # Chan's parallel variance (Welford extension over batches)
+                    n_a = st['count']
+                    n_b = count
+                    n_ab = n_a + n_b
+                    delta = mean_b - st['mean']
+                    new_mean = st['mean'] + delta * n_b / n_ab
+                    M2_new = st['M2'] + var_b * n_b + (delta ** 2) * n_a * n_b / n_ab
+                    st['count'] = n_ab
+                    st['mean'] = new_mean
+                    st['M2'] = M2_new
+                    st['dead_pct_sum'] += dead_pct
+                    st['max_abs'] = max(st['max_abs'], max_abs)
+                    st['n_batches'] += 1
+                    st['nan'] = st['nan'] or has_nan
+                    st['inf'] = st['inf'] or has_inf
         return hook_fn
+
+    def reset(self):
+        """Clear accumulated stats. Call at the start of each epoch."""
+        self.stats.clear()
+        self._nan_seen.clear()
+        self._inf_seen.clear()
 
     def remove(self):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
 
-    def summary(self) -> Dict[str, float]:
-        if not self.stats:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.remove()
+        return False
+
+    def _layer_stats(self) -> Dict[str, Dict[str, float]]:
+        out = {}
+        for name, st in self.stats.items():
+            if st['count'] == 0:
+                continue
+            var = st['M2'] / st['count']
+            out[name] = {
+                'mean': st['mean'],
+                'std': float(np.sqrt(max(var, 0.0))),
+                'dead_pct': st['dead_pct_sum'] / max(st['n_batches'], 1),
+                'max_abs': st['max_abs'],
+                'n_batches': st['n_batches'],
+                'nan': st['nan'],
+                'inf': st['inf'],
+            }
+        return out
+
+    def summary(self) -> Dict[str, Any]:
+        layer = self._layer_stats()
+        if not layer:
             return {}
-        dead_pcts = [s['dead_pct'] for s in self.stats.values()]
-        stds = [s['std'] for s in self.stats.values()]
+        dead_pcts = [s['dead_pct'] for s in layer.values()]
+        stds = [s['std'] for s in layer.values()]
         return {
             'dead_neuron_pct_mean': float(np.mean(dead_pcts)),
             'dead_neuron_pct_max': float(np.max(dead_pcts)),
             'activation_std_mean': float(np.mean(stds)),
             'activation_std_min': float(np.min(stds)),
-            'worst_layer': max(self.stats, key=lambda k: self.stats[k]['dead_pct']),
-            'n_monitored_layers': len(self.stats),
+            'worst_layer': max(layer, key=lambda k: layer[k]['dead_pct']),
+            'n_monitored_layers': len(layer),
+            'nan_layers': [n for n, s in layer.items() if s['nan']],
+            'inf_layers': [n for n, s in layer.items() if s['inf']],
         }
 
 
@@ -153,17 +235,37 @@ class TrainingMonitor:
         monitor.save_summary()
     """
 
-    def __init__(self, output_dir: str, detect_anomalies: bool = False):
+    def __init__(self, output_dir: str, detect_anomalies: bool = False,
+                 loss_spike_factor: float = 3.0, loss_spike_window: int = 20):
         self.diag_dir = Path(output_dir) / 'diagnostics'
         self.diag_dir.mkdir(parents=True, exist_ok=True)
         self.overfit_detector = OverfitDetector()
         self._weight_snapshot = None
         self._update_ratios = {}
         self._all_epoch_data: List[Dict] = []
+        self._train_loss_history: List[float] = []
+        self.loss_spike_factor = loss_spike_factor
+        self.loss_spike_window = loss_spike_window
         self.detect_anomalies = detect_anomalies
+        self._prev_anomaly_state: Optional[bool] = None
         if self.detect_anomalies:
+            self._prev_anomaly_state = torch.is_anomaly_enabled() if hasattr(torch, 'is_anomaly_enabled') else False
             torch.autograd.set_detect_anomaly(True)
             logger.warning("Anomaly detection ENABLED. Training will be slower.")
+
+    def close(self):
+        """Restore global state. Call when done with this monitor."""
+        if self.detect_anomalies and self._prev_anomaly_state is not None:
+            torch.autograd.set_detect_anomaly(bool(self._prev_anomaly_state))
+            self._prev_anomaly_state = None
+            self.detect_anomalies = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def run_sanity_checks(self, model, loader, criterion, optimizer, device, n_classes=None):
         """Run pre-training sanity checks. Call before epoch 0."""
@@ -213,9 +315,20 @@ class TrainingMonitor:
             val_targets: (N,) integer labels
             full_diagnostics: if True, run expensive checks (spectral analysis)
         """
-        n_classes = val_probs.shape[1] if val_probs.ndim == 2 else 2
-        val_preds = val_probs.argmax(axis=1)
+        val_probs = np.asarray(val_probs)
         val_targets = np.asarray(val_targets).flatten()
+
+        if val_probs.ndim == 1:
+            # Binary classifier with sigmoid output (N,) — expand to (N, 2)
+            p = val_probs.astype(np.float64)
+            val_probs = np.stack([1.0 - p, p], axis=1)
+        elif val_probs.ndim == 2 and val_probs.shape[1] == 1:
+            # (N, 1) sigmoid — expand
+            p = val_probs[:, 0].astype(np.float64)
+            val_probs = np.stack([1.0 - p, p], axis=1)
+
+        n_classes = val_probs.shape[1]
+        val_preds = val_probs.argmax(axis=1)
 
         if class_names is None:
             class_names = {i: f'class_{i}' for i in range(n_classes)}
@@ -314,9 +427,24 @@ class TrainingMonitor:
             'update_ratios': ur_summary,
             'stability': temporal,
             'spectral': spectral,
+            'learning_rate': learning_rate,
             'learning_rates': learning_rate,
-            'alerts': overfit_alerts,
+            'alerts': list(overfit_alerts),
         }
+
+        # Loss spike detection on train_loss
+        self._train_loss_history.append(float(train_loss))
+        if len(self._train_loss_history) > self.loss_spike_window + 1:
+            window = self._train_loss_history[-(self.loss_spike_window + 1):-1]
+            median_prev = float(np.median(window))
+            if train_loss > median_prev * self.loss_spike_factor and median_prev > 0:
+                spike_msg = (
+                    f"LOSS_SPIKE: train_loss={train_loss:.4f} > "
+                    f"{self.loss_spike_factor}x median({median_prev:.4f}) over last "
+                    f"{self.loss_spike_window} epochs"
+                )
+                diag['alerts'].append(spike_msg)
+                logger.warning(spike_msg)
 
         # Save JSON
         with open(self.diag_dir / f'epoch_{epoch:03d}.json', 'w') as f:
@@ -366,8 +494,9 @@ class TrainingMonitor:
             'entropy_mean': [_get(d, 'calibration', 'prediction_entropy_mean') for d in self._all_epoch_data],
             'confidence_gap': [_get(d, 'calibration', 'gap') for d in self._all_epoch_data],
             'update_ratio_mean': [_get(d, 'update_ratios', 'mean') for d in self._all_epoch_data],
-            'gpu_max_mem_mb_mean': float(np.mean([_get(d, 'performance', 'gpu_max_mem_alloc_mb') for d in self._all_epoch_data])) if self._all_epoch_data and 'performance' in self._all_epoch_data[0] else 0.0,
-            'compute_time_mean': float(np.mean([_get(d, 'performance', 'compute_time') for d in self._all_epoch_data])) if self._all_epoch_data and 'performance' in self._all_epoch_data[0] else 0.0,
+            'gpu_max_mem_mb': [_get(d, 'performance', 'gpu_max_mem_alloc_mb') for d in self._all_epoch_data],
+            'data_time': [_get(d, 'performance', 'data_time') for d in self._all_epoch_data],
+            'compute_time': [_get(d, 'performance', 'compute_time') for d in self._all_epoch_data],
         }
 
         with open(self.diag_dir / 'training_summary.json', 'w') as f:

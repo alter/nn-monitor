@@ -2,7 +2,7 @@
 Pure metric computation functions. No side effects, no I/O.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,6 +28,10 @@ def collect_weight_stats(model: nn.Module) -> Dict[str, Dict[str, float]]:
         w = param.data.float()
         if torch.isnan(w).any() or torch.isinf(w).any():
             w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+        q = torch.quantile(
+            w.flatten().cpu(),
+            torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95]),
+        ).tolist()
         stats[name] = {
             'mean': w.mean().item(),
             'std': w.std().item(),
@@ -35,8 +39,23 @@ def collect_weight_stats(model: nn.Module) -> Dict[str, Dict[str, float]]:
             'max': w.max().item(),
             'frobenius_norm': w.norm().item(),
             'near_zero_pct': (w.abs() < 1e-6).float().mean().item() * 100,
+            'q05': q[0], 'q25': q[1], 'q50': q[2], 'q75': q[3], 'q95': q[4],
+            'kurtosis_excess': _excess_kurtosis(w),
         }
     return stats
+
+
+def _excess_kurtosis(t: torch.Tensor) -> float:
+    """Pearson excess kurtosis. Heavy tail (>3) often signals pathological weights."""
+    x = t.flatten().float()
+    if x.numel() < 4:
+        return 0.0
+    m = x.mean()
+    s = x.std(unbiased=False)
+    if float(s) < 1e-12:
+        return 0.0
+    z = (x - m) / s
+    return float((z ** 4).mean().item() - 3.0)
 
 
 def snapshot_weights(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -73,30 +92,116 @@ def compute_weight_update_ratios(
     return ratios
 
 
-def collect_gradient_stats(model: nn.Module) -> Dict[str, float]:
+def collect_gradient_stats(model: nn.Module) -> Dict[str, Any]:
     """Gradient norm statistics across all layers.
 
-    Returns dict with grad_min, grad_max, grad_mean,
-    grad_zero_layers (vanishing), grad_exploding_layers.
+    Returns dict with grad_min/max/mean, total grad norm, vanishing/exploding
+    layer counts, NaN/Inf layer lists.
     """
-    grad_norms = []
+    grad_norms: List[float] = []
+    total_sq = 0.0
+    nan_layers: List[str] = []
+    inf_layers: List[str] = []
     for name, param in model.named_parameters():
-        if param.grad is not None:
-            g = param.grad.data
-            if torch.isnan(g).any() or torch.isinf(g).any():
-                g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
-            grad_norms.append(g.norm(2).item())
+        if param.grad is None:
+            continue
+        g = param.grad.data
+        if torch.isnan(g).any():
+            nan_layers.append(name)
+        if torch.isinf(g).any():
+            inf_layers.append(name)
+        if nan_layers or inf_layers:
+            g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+        n = float(g.norm(2).item())
+        grad_norms.append(n)
+        total_sq += n * n
 
     if not grad_norms:
         return {}
 
     return {
-        'grad_min': min(grad_norms),
-        'grad_max': max(grad_norms),
-        'grad_mean': sum(grad_norms) / len(grad_norms),
-        'grad_zero_layers': sum(1 for n in grad_norms if n < 1e-8),
-        'grad_exploding_layers': sum(1 for n in grad_norms if n > 100),
-        'grad_total_layers': len(grad_norms),
+        'grad_min': float(min(grad_norms)),
+        'grad_max': float(max(grad_norms)),
+        'grad_mean': float(sum(grad_norms) / len(grad_norms)),
+        'grad_total_norm': float(np.sqrt(total_sq)),
+        'grad_zero_layers': int(sum(1 for n in grad_norms if n < 1e-8)),
+        'grad_exploding_layers': int(sum(1 for n in grad_norms if n > 100)),
+        'grad_total_layers': int(len(grad_norms)),
+        'grad_nan_layers': nan_layers,
+        'grad_inf_layers': inf_layers,
+    }
+
+
+class GradientClipTracker:
+    """Count how often gradient clipping was triggered, and by how much.
+
+    Integrate next to `torch.nn.utils.clip_grad_norm_`:
+
+        tracker = GradientClipTracker()
+        for batch in loader:
+            loss.backward()
+            total = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            tracker.update(total_norm=total.item(), clip_value=1.0)
+            optimizer.step()
+        stats = tracker.summary()
+
+    Interpretation:
+        clip_rate > 0.5 → LR likely too high (clip as crutch)
+        clip_rate < 0.01 → clip_value probably set too loose
+    """
+
+    def __init__(self):
+        self.clipped = 0
+        self.total = 0
+        self.ratios: List[float] = []
+
+    def update(self, total_norm: float, clip_value: float):
+        self.total += 1
+        if total_norm > clip_value:
+            self.clipped += 1
+            self.ratios.append(total_norm / max(clip_value, 1e-12))
+
+    def summary(self) -> Dict[str, float]:
+        if self.total == 0:
+            return {}
+        return {
+            'clip_rate': self.clipped / self.total,
+            'clip_triggered': int(self.clipped),
+            'total_steps': int(self.total),
+            'avg_excess_ratio': float(np.mean(self.ratios)) if self.ratios else 0.0,
+            'max_excess_ratio': float(np.max(self.ratios)) if self.ratios else 0.0,
+        }
+
+    def reset(self):
+        self.clipped = 0
+        self.total = 0
+        self.ratios.clear()
+
+
+def detect_loss_spike(
+    losses: List[float],
+    window: int = 20,
+    factor: float = 3.0,
+) -> Dict[str, Any]:
+    """Check whether the most recent loss is a spike vs rolling median.
+
+    Returns ok=False with detail when loss[-1] > factor * median(loss[-window-1:-1]).
+    """
+    if len(losses) < window + 1:
+        return {'ok': True, 'reason': 'insufficient history'}
+    recent = losses[-(window + 1):-1]
+    current = float(losses[-1])
+    med = float(np.median(recent))
+    if med <= 0:
+        return {'ok': True, 'reason': 'non-positive median'}
+    ratio = current / med
+    return {
+        'ok': ratio <= factor,
+        'current': current,
+        'median_window': med,
+        'ratio': ratio,
+        'factor': factor,
+        'window': window,
     }
 
 
@@ -195,12 +300,17 @@ def effective_rank(weight: torch.Tensor) -> float:
         ~1.0 = full rank (no compression, like random init)
         0.3-0.8 = healthy (model learned structured patterns)
         < 0.1 = rank collapse (model lost capacity, early overfit sign)
+
+    Note: for Conv2d (out_c, in_c, kH, kW) and higher-dim tensors, we
+    flatten to (out_c, in_c*kH*kW). This gives a coarse estimate —
+    the true convolutional rank requires unfold + Toeplitz expansion,
+    which is expensive.
     """
     if weight.dim() < 2:
         return float(weight.numel())
     W = weight.detach().float().cpu()
     if W.dim() > 2:
-        W = W.view(W.shape[0], -1)
+        W = W.reshape(W.shape[0], -1)
     try:
         S = torch.linalg.svdvals(W)
     except Exception:
@@ -301,16 +411,22 @@ def compute_psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> D
     expected_counts, _ = np.histogram(expected_flat, bins=breakpoints)
     actual_counts, _ = np.histogram(actual_flat, bins=breakpoints)
 
-    expected_perc = np.maximum(expected_counts / len(expected_flat), 1e-4)
-    actual_perc = np.maximum(actual_counts / len(actual_flat), 1e-4)
+    # Relative smoothing floor — absolute 1e-4 inflates PSI on small samples
+    floor_e = 1.0 / max(len(expected_flat), 1)
+    floor_a = 1.0 / max(len(actual_flat), 1)
+    expected_perc = np.maximum(expected_counts / len(expected_flat), floor_e)
+    actual_perc = np.maximum(actual_counts / len(actual_flat), floor_a)
 
     psi_values = (actual_perc - expected_perc) * np.log(actual_perc / expected_perc)
     total_psi = float(np.sum(psi_values))
 
     return {
         'psi_total': round(total_psi, 4),
-        'drift_detected': total_psi > 0.1,
-        'bins_used': len(breakpoints) - 1,
+        'drift_detected': bool(total_psi > 0.1),
+        'severity': 'none' if total_psi < 0.1 else ('moderate' if total_psi < 0.2 else 'significant'),
+        'bins_used': int(len(breakpoints) - 1),
+        'n_expected': int(len(expected_flat)),
+        'n_actual': int(len(actual_flat)),
     }
 
 

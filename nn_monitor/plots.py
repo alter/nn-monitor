@@ -110,13 +110,14 @@ def plot_weight_update_ratios(ratios: Dict[str, float], save_path):
 
 
 def plot_training_curves(summary: dict, save_path):
-    """6-panel training summary: loss, accuracy, ECE, confidence gap, entropy, update ratio."""
+    """8-panel training summary: loss, accuracy, ECE, conf gap, entropy,
+    update ratio, GPU memory, compute time."""
     plt = _get_plt()
     epochs = summary.get('epochs', [])
     if len(epochs) < 2:
         return
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+    fig, axes = plt.subplots(4, 2, figsize=(14, 16))
     fig.suptitle('Training Summary', fontsize=14)
 
     panels = [
@@ -129,19 +130,26 @@ def plot_training_curves(summary: dict, save_path):
         (axes[1, 1], 'Confidence Gap (correct - wrong)', [('confidence_gap', None, '#FF7043')]),
         (axes[2, 0], 'Prediction Entropy (mean)', [('entropy_mean', None, '#26A69A')]),
         (axes[2, 1], 'Weight Update Ratio', [('update_ratio_mean', None, '#5C6BC0')]),
+        (axes[3, 0], 'GPU Max Memory (MB)', [('gpu_max_mem_mb', None, '#8D6E63')]),
+        (axes[3, 1], 'Epoch Time (s)', [
+            ('data_time', 'data', '#FFB300'),
+            ('compute_time', 'compute', '#29B6F6'),
+        ]),
     ]
 
     for ax, title, series_list in panels:
+        has_data = False
         for key, label, color in series_list:
             data = summary.get(key, [])
-            if data and any(v > 0 for v in data if v is not None):
+            if data and any((v or 0) > 0 for v in data):
                 ax.plot(epochs[:len(data)], data, label=label, color=color)
+                has_data = True
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
-        if any(label for _, label, _ in series_list if label):
+        if has_data and any(label for _, label, _ in series_list if label):
             ax.legend()
 
-    # Add target line for update ratio
+    # Log scale + target line for update ratio
     ax = axes[2, 1]
     if summary.get('update_ratio_mean'):
         ax.set_yscale('log')
@@ -149,9 +157,47 @@ def plot_training_curves(summary: dict, save_path):
         ax.legend()
 
     axes[1, 1].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-    axes[2, 0].set_xlabel('Epoch')
-    axes[2, 1].set_xlabel('Epoch')
+    axes[3, 0].set_xlabel('Epoch')
+    axes[3, 1].set_xlabel('Epoch')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=120)
+    plt.close()
+
+
+def plot_grad_profile(grad_profile, save_path, time_dim_label: str = 't'):
+    """Plot |dL/dx| vs time index — receptive-field decay visualization."""
+    plt = _get_plt()
+    if not grad_profile:
+        return
+    import numpy as _np
+    g = _np.asarray(grad_profile)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(range(len(g)), g, color='#EF5350')
+    ax.set_yscale('log')
+    ax.set_xlabel(f'{time_dim_label} (oldest → newest)')
+    ax.set_ylabel('|dL/dx| (log)')
+    ax.set_title('Receptive-Field Gradient Profile')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100)
+    plt.close()
+
+
+def plot_attention_heatmap(attn, save_path, head: int = 0):
+    """Plot a single attention head heatmap. attn: (B, H, L, L) or (H, L, L) or (L, L)."""
+    plt = _get_plt()
+    import numpy as _np
+    import torch as _torch
+    a = attn.detach().cpu() if _torch.is_tensor(attn) else _torch.as_tensor(attn)
+    while a.dim() > 2:
+        a = a[0] if head == 0 else a[min(head, a.shape[0] - 1)]
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(a.numpy(), cmap='viridis', aspect='auto')
+    ax.set_xlabel('key position')
+    ax.set_ylabel('query position')
+    ax.set_title('Attention Heatmap')
+    fig.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100)
     plt.close()
