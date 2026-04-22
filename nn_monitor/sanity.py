@@ -14,12 +14,36 @@ logger = logging.getLogger(__name__)
 
 
 def _unpack_batch(batch, device):
-    """(features, targets) or (features, extras, targets) → tuple."""
+    """Unpack a loader batch regardless of its arity.
+
+    Supported layouts:
+      2-tuple: (features, targets)
+      3-tuple: (features, global_features, targets)
+      5-tuple: (features, global_features, targets, sample_weights, swing_amp)
+               — emitted by CudaBatchLoader when swing_amplitude_pct is present
+
+    ``targets`` is always the 3rd element (index 2) for 3-and-5-tuples, or the
+    last element for 2-tuples.  Using ``batch[-1]`` broke when the 5-tuple was
+    introduced because it picked up swing_amplitude_pct instead of the class
+    labels, causing out-of-bounds scatter inside SwingLoss.
+    """
     if not isinstance(batch, (list, tuple)):
         raise ValueError("Loader must yield tuple/list")
+    n = len(batch)
     features = batch[0].to(device)
-    targets = batch[-1].to(device)
-    extras = batch[1].to(device) if len(batch) == 3 else None
+    if n == 2:
+        # (features, targets)
+        targets = batch[1].to(device)
+        extras = None
+    elif n == 3:
+        # (features, global_features, targets)
+        extras = batch[1].to(device) if batch[1] is not None else None
+        targets = batch[2].to(device)
+    else:
+        # 4- or 5-tuple: (features, global_features, targets, ...)
+        # targets is always at index 2; ignore sample_weights / swing_amp
+        extras = batch[1].to(device) if batch[1] is not None else None
+        targets = batch[2].to(device)
     return features, extras, targets
 
 
@@ -51,7 +75,12 @@ def check_loss_at_init(model, loader, criterion, device, n_classes=None) -> Dict
         batch = next(iter(loader))
         features, extras, targets = _unpack_batch(batch, device)
         outputs = _forward(model, features, extras)
-        loss = criterion(outputs, targets).item()
+        raw_loss = criterion(outputs, targets)
+        # SwingLoss returns a dict {'loss': tensor, ...}; plain losses return a scalar tensor.
+        if isinstance(raw_loss, dict):
+            loss = raw_loss['loss'].item()
+        else:
+            loss = raw_loss.item()
 
         if n_classes is None:
             if outputs.dim() == 2 and outputs.shape[1] > 1:
@@ -105,7 +134,9 @@ def check_overfit_one_batch(
     for step in range(n_steps):
         optimizer.zero_grad()
         outputs = _forward(model, features, extras)
-        loss = criterion(outputs, targets)
+        raw_loss = criterion(outputs, targets)
+        # SwingLoss returns a dict {'loss': tensor, ...}; plain losses return a scalar tensor.
+        loss = raw_loss['loss'] if isinstance(raw_loss, dict) else raw_loss
         loss.backward()
         optimizer.step()
 
