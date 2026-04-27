@@ -1,0 +1,33 @@
+@directory: libs/nn-monitor
+@updated: 2026-04-23T16:11:31Z
+@status: in_progress
+@purpose: nn-monitor
+
+@files:
+  README.md
+  setup.py
+  test_monitor.py
+
+@exports:
+  test_monitor.py::class DummyConv
+  test_monitor.py::class CausalTCN
+  test_monitor.py::class LeakyConv
+  test_monitor.py::def test_metrics
+  test_monitor.py::def test_activation_monitor_welford
+  test_monitor.py::def test_sanity_receptive_field
+  test_monitor.py::def test_causal_leakage_detects_leak
+  test_monitor.py::def test_time_split
+  test_monitor.py::def test_loss_at_init_and_overfit
+  test_monitor.py::def test_grad_flow
+  test_monitor.py::def test_transformer_suite
+  test_monitor.py::def test_hmm_suite
+  test_monitor.py::def test_core_end_to_end
+
+@imports:
+  nn_monitor
+  numpy
+  pathlib
+  setuptools
+  shutil
+  tempfile
+  torch

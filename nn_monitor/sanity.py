@@ -82,15 +82,19 @@ def check_loss_at_init(model, loader, criterion, device, n_classes=None) -> Dict
         else:
             loss = raw_loss.item()
 
+        # Multi-head models emit a dict {'logits', 'magnitude', 'regime'};
+        # keep the logits tensor for downstream dim/shape inspection.
+        _out = outputs['logits'] if isinstance(outputs, dict) else outputs
+
         if n_classes is None:
-            if outputs.dim() == 2 and outputs.shape[1] > 1:
-                n_classes = outputs.shape[1]
-            elif outputs.dim() >= 2 and outputs.shape[1] == 1:
+            if _out.dim() == 2 and _out.shape[1] > 1:
+                n_classes = _out.shape[1]
+            elif _out.dim() >= 2 and _out.shape[1] == 1:
                 n_classes = 2  # sigmoid logit
-            elif outputs.dim() == 1:
+            elif _out.dim() == 1:
                 n_classes = 2  # BCE-style
             else:
-                n_classes = int(outputs.shape[-1])
+                n_classes = int(_out.shape[-1])
 
     expected = float(-np.log(1.0 / n_classes))
     deviation = abs(loss - expected) / expected if expected > 0 else 0.0
@@ -141,12 +145,14 @@ def check_overfit_one_batch(
         optimizer.step()
 
         with torch.no_grad():
-            if outputs.dim() >= 2 and outputs.shape[-1] > 1:
-                preds = outputs.argmax(dim=-1)
+            # Multi-head models emit dict outputs; inspect logits for accuracy.
+            _out = outputs['logits'] if isinstance(outputs, dict) else outputs
+            if _out.dim() >= 2 and _out.shape[-1] > 1:
+                preds = _out.argmax(dim=-1)
                 acc = (preds == targets).float().mean().item() * 100
             else:
                 # Binary sigmoid case
-                preds = (outputs.view(-1) > 0).long()
+                preds = (_out.view(-1) > 0).long()
                 t = targets.view(-1).long()
                 acc = (preds == t).float().mean().item() * 100
         losses.append(loss.item())

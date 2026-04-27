@@ -1,0 +1,90 @@
+@directory: libs/nn-monitor/nn_monitor
+@updated: 2026-04-25T07:59:49Z
+@status: in_progress
+@purpose: nn-monitor: Neural Network Training Monitoring Framework
+
+Standalone framework for monitoring, debugging, and diagnosing
+
+@files:
+  __init__.py
+  core.py
+  hmm.py
+  lgbm.py
+  metrics.py
+  plots.py
+  sanity.py
+  transformer.py
+
+@exports:
+  core.py::class ActivationMonitor
+  core.py::class OverfitDetector
+  core.py::class TrainingMonitor
+  hmm.py::def check_transition_matrix
+  hmm.py::def state_occupancy
+  hmm.py::def dwell_times
+  hmm.py::def emission_entropy
+  hmm.py::def gaussian_emission_separability
+  hmm.py::def check_ll_convergence
+  hmm.py::def viterbi_stability
+  hmm.py::def check_forward_backward_stability
+  hmm.py::def run_hmm_diagnostics
+  lgbm.py::def training_curve_stats
+  lgbm.py::def tree_structure_stats
+  lgbm.py::def importance_disagreement
+  lgbm.py::def feature_concentration
+  lgbm.py::def feature_drift
+  lgbm.py::def run_lgbm_diagnostics
+  metrics.py::class GradientClipTracker
+  metrics.py::def collect_weight_stats
+  metrics.py::def snapshot_weights
+  metrics.py::def compute_weight_update_ratios
+  metrics.py::def collect_gradient_stats
+  metrics.py::def detect_loss_spike
+  metrics.py::def compute_ece
+  metrics.py::def prediction_entropy
+  metrics.py::def confidence_gap
+  metrics.py::def effective_rank
+  metrics.py::def track_effective_ranks
+  metrics.py::def temporal_stability
+  metrics.py::def prediction_stability_noise
+  metrics.py::def compute_psi
+  metrics.py::def compute_attention_entropy
+  plots.py::def plot_reliability_diagram
+  plots.py::def plot_gradient_flow
+  plots.py::def plot_weight_update_ratios
+  plots.py::def plot_training_curves
+  plots.py::def plot_grad_profile
+  plots.py::def plot_attention_heatmap
+  sanity.py::def check_loss_at_init
+  sanity.py::def check_overfit_one_batch
+  sanity.py::def verify_gradient_flow
+  sanity.py::def check_receptive_field_gradients
+  sanity.py::def check_causal_leakage
+  sanity.py::def check_time_split
+  transformer.py::class AttentionMonitor
+  transformer.py::class ResidualStreamMonitor
+  transformer.py::def attention_collapse_stats
+  transformer.py::def head_redundancy
+  transformer.py::def positional_encoding_drift
+  transformer.py::def tcn_receptive_field
+  transformer.py::def check_layer_causal_leakage
+
+@imports:
+  copy
+  core
+  hmm
+  hmmlearn
+  json
+  lgbm
+  logging
+  matplotlib
+  metrics
+  numpy
+  pathlib
+  plots
+  sanity
+  scipy
+  sklearn
+  torch
+  transformer
+  typing
