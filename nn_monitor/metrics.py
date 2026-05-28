@@ -12,8 +12,21 @@ import torch.nn as nn
 #  Weight & Gradient Statistics
 # ─────────────────────────────────────────────
 
-def collect_weight_stats(model: nn.Module) -> Dict[str, Dict[str, float]]:
+def collect_weight_stats(
+    model: nn.Module,
+    compute_quantiles: bool = True,
+    max_quantile_elems: int = 1_000_000,
+) -> Dict[str, Dict[str, float]]:
     """Per-layer weight statistics: mean, std, frobenius norm, near-zero %.
+
+    Args:
+        compute_quantiles: also compute q05..q95 and excess kurtosis. These are
+            the expensive part (sorting); disable on LLM-scale layers to keep
+            this O(n) instead of O(n log n).
+        max_quantile_elems: when a weight tensor exceeds this, quantiles and
+            kurtosis are estimated on a uniform random subsample. This avoids
+            both the cost of sorting huge matrices and ``torch.quantile``'s
+            hard input-size limit (~2**24 elements), which otherwise raises.
 
     Example:
         stats = collect_weight_stats(model)
@@ -28,20 +41,27 @@ def collect_weight_stats(model: nn.Module) -> Dict[str, Dict[str, float]]:
         w = param.data.float()
         if torch.isnan(w).any() or torch.isinf(w).any():
             w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-        q = torch.quantile(
-            w.flatten().cpu(),
-            torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95]),
-        ).tolist()
-        stats[name] = {
+        s = {
             'mean': w.mean().item(),
             'std': w.std().item(),
             'min': w.min().item(),
             'max': w.max().item(),
             'frobenius_norm': w.norm().item(),
             'near_zero_pct': (w.abs() < 1e-6).float().mean().item() * 100,
-            'q05': q[0], 'q25': q[1], 'q50': q[2], 'q75': q[3], 'q95': q[4],
-            'kurtosis_excess': _excess_kurtosis(w),
         }
+        if compute_quantiles:
+            flat = w.flatten()
+            if flat.numel() > max_quantile_elems:
+                idx = torch.randint(flat.numel(), (max_quantile_elems,), device=flat.device)
+                flat = flat[idx]
+            q = torch.quantile(
+                flat, torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], device=flat.device)
+            ).tolist()
+            s.update({
+                'q05': q[0], 'q25': q[1], 'q50': q[2], 'q75': q[3], 'q95': q[4],
+                'kurtosis_excess': _excess_kurtosis(flat),
+            })
+        stats[name] = s
     return stats
 
 
@@ -58,18 +78,31 @@ def _excess_kurtosis(t: torch.Tensor) -> float:
     return float((z ** 4).mean().item() - 3.0)
 
 
-def snapshot_weights(model: nn.Module) -> Dict[str, torch.Tensor]:
+def snapshot_weights(model: nn.Module, max_layers: Optional[int] = None) -> Dict[str, torch.Tensor]:
     """Clone current weights for update ratio computation.
+
+    Cloning every weight matrix doubles parameter memory for one step — fine for
+    small models, prohibitive for LLMs. Pass ``max_layers`` to snapshot only an
+    evenly-spaced subset (first, last, and points in between are always kept so
+    the embedding and output layers are represented).
 
     Usage:
         snap = snapshot_weights(model)
         optimizer.step()
         ratios = compute_weight_update_ratios(snap, model)
     """
+    names = [
+        name for name, param in model.named_parameters()
+        if 'weight' in name and param.dim() >= 2
+    ]
+    if max_layers is not None and len(names) > max_layers:
+        idx = np.linspace(0, len(names) - 1, max_layers).round().astype(int)
+        names = [names[i] for i in sorted(set(idx.tolist()))]
+    selected = set(names)
     return {
         name: param.data.clone()
         for name, param in model.named_parameters()
-        if 'weight' in name and param.dim() >= 2
+        if name in selected
     }
 
 
@@ -320,13 +353,23 @@ def effective_rank(weight: torch.Tensor) -> float:
     return torch.exp(entropy).item()
 
 
-def track_effective_ranks(model: nn.Module) -> Dict[str, Dict[str, float]]:
-    """Effective rank ratio per weight matrix."""
+def track_effective_ranks(model: nn.Module, max_dim: int = 4096) -> Dict[str, Dict[str, float]]:
+    """Effective rank ratio per weight matrix.
+
+    Args:
+        max_dim: skip matrices whose smaller dimension exceeds this. Full SVD is
+            O(min(m,n)^2 * max(m,n)); on LLM-scale projections it dominates
+            wall-clock and can OOM. Skipped layers are reported as ``skipped``.
+    """
     ranks = {}
     for name, param in model.named_parameters():
         if 'weight' not in name or param.dim() < 2:
             continue
-        max_rank = min(param.shape)
+        flat_shape = (param.shape[0], int(np.prod(param.shape[1:])))
+        max_rank = min(flat_shape)
+        if max_rank > max_dim:
+            ranks[name] = {'skipped': True, 'max_rank': int(max_rank), 'reason': 'exceeds max_dim'}
+            continue
         eff = effective_rank(param.data)
         ranks[name] = {
             'effective_rank': round(eff, 2),

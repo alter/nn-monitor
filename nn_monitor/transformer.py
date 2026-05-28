@@ -10,14 +10,72 @@ Addresses the failure modes that generic activation/weight monitoring misses:
 - autoregressive causal leakage regression check (per-layer)
 """
 
+import contextlib
 import logging
+import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def capture_sdpa_attention(max_calls: int = 16, store: Optional[Dict[str, torch.Tensor]] = None):
+    """Capture attention weights from models using fused scaled_dot_product_attention.
+
+    FlashAttention / fused SDPA never materialize the attention matrix, so
+    forward hooks on attention modules see no weights. This temporarily patches
+    ``torch.nn.functional.scaled_dot_product_attention`` to recompute the
+    softmax(QK^T/√d + mask) probabilities on the math path and store them, while
+    still returning the real (fast) output.
+
+    Diagnostic only — adds an O(L²) recompute per call. Run on a handful of
+    batches, not the whole epoch. ``max_calls`` caps stored tensors.
+
+        with capture_sdpa_attention() as attn:
+            model(x)
+        for name, A in attn.items():
+            stats = attention_collapse_stats(A)   # (B, H, L, L)
+    """
+    captured: Dict[str, torch.Tensor] = store if store is not None else {}
+    orig = F.scaled_dot_product_attention
+    counter = {'n': 0}
+
+    def patched(query, key, value, attn_mask=None, dropout_p=0.0,
+                is_causal=False, scale=None, **kwargs):
+        out = orig(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+                   is_causal=is_causal, scale=scale, **kwargs)
+        if counter['n'] < max_calls:
+            try:
+                with torch.no_grad():
+                    d = query.shape[-1]
+                    sm_scale = scale if scale is not None else 1.0 / math.sqrt(d)
+                    scores = (query.float() @ key.float().transpose(-2, -1)) * sm_scale
+                    L, S = query.shape[-2], key.shape[-2]
+                    if is_causal:
+                        mask = torch.ones(L, S, dtype=torch.bool, device=scores.device).tril()
+                        scores = scores.masked_fill(~mask, float('-inf'))
+                    elif attn_mask is not None:
+                        if attn_mask.dtype == torch.bool:
+                            scores = scores.masked_fill(~attn_mask, float('-inf'))
+                        else:
+                            scores = scores + attn_mask.float()
+                    probs = torch.softmax(scores, dim=-1).detach().cpu()
+                    captured[f'sdpa_{counter["n"]}'] = probs
+                    counter['n'] += 1
+            except Exception as e:  # never break the forward pass
+                logger.warning(f"SDPA capture failed: {e}")
+        return out
+
+    F.scaled_dot_product_attention = patched
+    try:
+        yield captured
+    finally:
+        F.scaled_dot_product_attention = orig
 
 
 # ─────────────────────────────────────────────

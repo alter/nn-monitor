@@ -22,6 +22,8 @@ from .plots import (
     plot_reliability_diagram, plot_gradient_flow,
     plot_weight_update_ratios, plot_training_curves,
 )
+from .llm import perplexity_from_loss, token_throughput, estimate_mfu
+from .trackers import _log_all
 
 logger = logging.getLogger(__name__)
 
@@ -200,10 +202,20 @@ class OverfitDetector:
         if len(self.history['val_loss']) >= self.patience:
             recent_val = self.history['val_loss'][-self.patience:]
             recent_train = self.history['train_loss'][-self.patience:]
-            val_rising = all(recent_val[i] < recent_val[i + 1] for i in range(len(recent_val) - 1))
-            train_falling = all(recent_train[i] > recent_train[i + 1] for i in range(len(recent_train) - 1))
-            if val_rising and train_falling:
-                alerts.append(f"OVERFIT: val_loss rising for {self.patience} epochs while train_loss falling")
+            # Trend-based, not strict monotonicity: real overfitting is noisy and
+            # rarely increases every single epoch. Fit a line over the window and
+            # check val trending up while train trends down. Also flag when val
+            # has stayed clearly above its running minimum for the whole window.
+            x = np.arange(self.patience)
+            val_slope = float(np.polyfit(x, recent_val, 1)[0])
+            train_slope = float(np.polyfit(x, recent_train, 1)[0])
+            val_min = min(self.history['val_loss'][:-self.patience] or [recent_val[0]])
+            above_min = all(v > val_min for v in recent_val)
+            if (val_slope > 0 and train_slope < 0) or (above_min and train_slope < 0):
+                alerts.append(
+                    f"OVERFIT: val_loss trending up (slope={val_slope:.2e}) "
+                    f"for {self.patience} epochs while train_loss falling"
+                )
 
         acc_gap = train_acc - val_acc
         if acc_gap > self.acc_gap_threshold:
@@ -236,7 +248,9 @@ class TrainingMonitor:
     """
 
     def __init__(self, output_dir: str, detect_anomalies: bool = False,
-                 loss_spike_factor: float = 3.0, loss_spike_window: int = 20):
+                 loss_spike_factor: float = 3.0, loss_spike_window: int = 20,
+                 trackers: Optional[List[Any]] = None,
+                 snapshot_max_layers: Optional[int] = None):
         self.diag_dir = Path(output_dir) / 'diagnostics'
         self.diag_dir.mkdir(parents=True, exist_ok=True)
         self.overfit_detector = OverfitDetector()
@@ -244,8 +258,13 @@ class TrainingMonitor:
         self._update_ratios = {}
         self._all_epoch_data: List[Dict] = []
         self._train_loss_history: List[float] = []
+        self._step_loss_history: List[float] = []
+        self._steps_path = self.diag_dir / 'steps.jsonl'
+        self._last_grad_stats: Optional[Dict[str, Any]] = None
         self.loss_spike_factor = loss_spike_factor
         self.loss_spike_window = loss_spike_window
+        self.snapshot_max_layers = snapshot_max_layers
+        self.trackers = list(trackers) if trackers else []
         self.detect_anomalies = detect_anomalies
         self._prev_anomaly_state: Optional[bool] = None
         if self.detect_anomalies:
@@ -259,6 +278,11 @@ class TrainingMonitor:
             torch.autograd.set_detect_anomaly(bool(self._prev_anomaly_state))
             self._prev_anomaly_state = None
             self.detect_anomalies = False
+        for t in self.trackers:
+            try:
+                t.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
@@ -283,14 +307,29 @@ class TrainingMonitor:
         return checks
 
     def before_optimizer_step(self, model):
-        """Call BEFORE optimizer.step() to snapshot weights."""
-        self._weight_snapshot = snapshot_weights(model)
+        """Call BEFORE optimizer.step() to snapshot weights.
+
+        Honors ``snapshot_max_layers`` so update-ratio tracking does not double
+        full parameter memory on large models.
+        """
+        self._weight_snapshot = snapshot_weights(model, max_layers=self.snapshot_max_layers)
 
     def after_optimizer_step(self, model):
         """Call AFTER optimizer.step() to compute update ratios."""
         if self._weight_snapshot:
             self._update_ratios = compute_weight_update_ratios(self._weight_snapshot, model)
             self._weight_snapshot = None
+
+    def capture_gradient_stats(self, model):
+        """Snapshot gradient health from current ``.grad`` buffers.
+
+        Call right after ``loss.backward()`` and before ``optimizer.zero_grad()``.
+        ``log_epoch`` reads gradients from live ``.grad`` buffers, which are
+        empty if you zero them at the end of the loop; capturing here makes the
+        gradient panel reliable regardless of where zero_grad lives.
+        """
+        self._last_grad_stats = collect_gradient_stats(model)
+        return self._last_grad_stats
 
     def log_epoch(
         self,
@@ -371,8 +410,10 @@ class TrainingMonitor:
                 'frozen_layers': sum(1 for v in ur_vals if v < 1e-6),
             }
 
-        # Gradient stats
-        grad_stats = collect_gradient_stats(model)
+        # Gradient stats — prefer values captured at backward time (see
+        # capture_gradient_stats); fall back to live .grad buffers.
+        grad_stats = self._last_grad_stats or collect_gradient_stats(model)
+        self._last_grad_stats = None
 
         # Temporal stability
         temporal = temporal_stability(val_preds)
@@ -384,11 +425,12 @@ class TrainingMonitor:
         spectral = {}
         if full_diagnostics:
             ranks = track_effective_ranks(model)
-            if ranks:
-                ratios = [r['ratio'] for r in ranks.values()]
+            ratios = [r['ratio'] for r in ranks.values() if 'ratio' in r]
+            if ratios:
                 spectral = {
                     'effective_rank_ratio_mean': round(float(np.mean(ratios)), 4),
                     'effective_rank_ratio_min': round(float(np.min(ratios)), 4),
+                    'n_skipped_layers': sum(1 for r in ranks.values() if r.get('skipped')),
                 }
 
         # Performance/System (Memory and Time)
@@ -452,6 +494,10 @@ class TrainingMonitor:
 
         self._all_epoch_data.append(diag)
 
+        # Stream scalars to any attached trackers (TensorBoard / W&B)
+        if self.trackers:
+            _log_all(self.trackers, diag, step=epoch)
+
         # Plots
         try:
             plot_reliability_diagram(val_probs, val_targets,
@@ -471,6 +517,79 @@ class TrainingMonitor:
             logger.warning(f"  ALERT: {alert}")
 
         return diag
+
+    def log_step(
+        self,
+        step: int,
+        *,
+        loss: Optional[float] = None,
+        learning_rate: Optional[Union[float, Dict[str, float]]] = None,
+        grad_norm: Optional[float] = None,
+        tokens: Optional[int] = None,
+        step_time: Optional[float] = None,
+        n_params: Optional[int] = None,
+        peak_flops: Optional[float] = None,
+        seq_len: Optional[int] = None,
+        n_layers: Optional[int] = None,
+        d_model: Optional[int] = None,
+        grad_noise: Optional[Dict[str, float]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Lightweight per-step logging for step-based (LLM) training.
+
+        Unlike ``log_epoch`` this does no model introspection — it just records
+        loss/perplexity, throughput, MFU, grad norm and any extras you pass,
+        appends a line to ``diagnostics/steps.jsonl`` and streams to trackers.
+        Cheap enough to call every optimizer step.
+
+        Args:
+            loss: mean token cross-entropy in nats (for perplexity).
+            tokens, step_time: enable tokens/sec; with n_params & peak_flops, MFU.
+            grad_noise: output of GradientNoiseTracker.summary(), logged as-is.
+            extra: arbitrary scalar metrics merged into the record.
+        """
+        rec: Dict[str, Any] = {'step': int(step)}
+        if loss is not None:
+            rec['loss'] = round(float(loss), 6)
+            rec['perplexity'] = round(perplexity_from_loss(float(loss)), 4)
+        if learning_rate is not None:
+            rec['learning_rate'] = learning_rate
+        if grad_norm is not None:
+            rec['grad_norm'] = float(grad_norm)
+        if tokens is not None and step_time:
+            tps = token_throughput(int(tokens), float(step_time))
+            rec['tokens_per_sec'] = round(tps, 2)
+            if n_params and peak_flops:
+                rec['mfu'] = estimate_mfu(
+                    int(n_params), tps, float(peak_flops),
+                    seq_len=seq_len, n_layers=n_layers, d_model=d_model,
+                )['mfu']
+        if step_time is not None:
+            rec['step_time'] = round(float(step_time), 5)
+        if grad_noise:
+            rec['grad_noise'] = grad_noise
+        if extra:
+            rec.update(extra)
+
+        # Step-level loss spike detection (rolling median)
+        if loss is not None:
+            self._step_loss_history.append(float(loss))
+            if len(self._step_loss_history) > self.loss_spike_window + 1:
+                window = self._step_loss_history[-(self.loss_spike_window + 1):-1]
+                med = float(np.median(window))
+                if med > 0 and float(loss) > med * self.loss_spike_factor:
+                    msg = (f"LOSS_SPIKE@step{step}: {loss:.4f} > "
+                           f"{self.loss_spike_factor}x median({med:.4f})")
+                    rec['loss_spike'] = msg
+                    logger.warning(msg)
+
+        with open(self._steps_path, 'a') as f:
+            f.write(json.dumps(rec, default=str) + '\n')
+
+        if self.trackers:
+            _log_all(self.trackers, rec, step=int(step))
+
+        return rec
 
     def save_summary(self):
         """Save summary of all epochs. Call after training completes."""
@@ -502,5 +621,10 @@ class TrainingMonitor:
         with open(self.diag_dir / 'training_summary.json', 'w') as f:
             json.dump(summary, f, indent=2)
 
-        plot_training_curves(summary, self.diag_dir / 'training_curves.png')
+        # Plotting is optional (matplotlib may be absent / headless-broken);
+        # a failed plot must not discard the summary that just finished training.
+        try:
+            plot_training_curves(summary, self.diag_dir / 'training_curves.png')
+        except Exception as e:
+            logger.warning(f"training_curves plot failed: {e}")
         logger.info(f"Training summary saved to {self.diag_dir}")

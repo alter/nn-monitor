@@ -1,5 +1,5 @@
 @directory: libs/nn-monitor/nn_monitor
-@updated: 2026-04-25T07:59:49Z
+@updated: 2026-05-28T00:00:00Z
 @status: in_progress
 @purpose: nn-monitor: Neural Network Training Monitoring Framework
 
@@ -10,9 +10,11 @@ Standalone framework for monitoring, debugging, and diagnosing
   core.py
   hmm.py
   lgbm.py
+  llm.py
   metrics.py
   plots.py
   sanity.py
+  trackers.py
   transformer.py
 
 @exports:
@@ -34,6 +36,13 @@ Standalone framework for monitoring, debugging, and diagnosing
   lgbm.py::def feature_concentration
   lgbm.py::def feature_drift
   lgbm.py::def run_lgbm_diagnostics
+  llm.py::def perplexity_from_loss
+  llm.py::def bits_per_token
+  llm.py::def bits_per_byte
+  llm.py::def token_throughput
+  llm.py::def estimate_mfu
+  llm.py::def gradient_noise_scale
+  llm.py::class GradientNoiseTracker
   metrics.py::class GradientClipTracker
   metrics.py::def collect_weight_stats
   metrics.py::def snapshot_weights
@@ -61,6 +70,9 @@ Standalone framework for monitoring, debugging, and diagnosing
   sanity.py::def check_receptive_field_gradients
   sanity.py::def check_causal_leakage
   sanity.py::def check_time_split
+  trackers.py::def flatten_scalars
+  trackers.py::class TensorBoardTracker
+  trackers.py::class WandbTracker
   transformer.py::class AttentionMonitor
   transformer.py::class ResidualStreamMonitor
   transformer.py::def attention_collapse_stats
@@ -68,17 +80,22 @@ Standalone framework for monitoring, debugging, and diagnosing
   transformer.py::def positional_encoding_drift
   transformer.py::def tcn_receptive_field
   transformer.py::def check_layer_causal_leakage
+  transformer.py::def capture_sdpa_attention
 
 @imports:
+  contextlib
   copy
   core
   hmm
   hmmlearn
   json
   lgbm
+  llm
   logging
+  math
   matplotlib
   metrics
+  numbers
   numpy
   pathlib
   plots
@@ -86,5 +103,6 @@ Standalone framework for monitoring, debugging, and diagnosing
   scipy
   sklearn
   torch
+  trackers
   transformer
   typing

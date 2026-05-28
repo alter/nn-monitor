@@ -98,9 +98,26 @@ from .transformer import (
     positional_encoding_drift,
     tcn_receptive_field,
     check_layer_causal_leakage,
+    capture_sdpa_attention,
 )
 
-__version__ = '1.1.0'
+from .llm import (
+    perplexity_from_loss,
+    bits_per_token,
+    bits_per_byte,
+    token_throughput,
+    estimate_mfu,
+    gradient_noise_scale,
+    GradientNoiseTracker,
+)
+
+from .trackers import (
+    TensorBoardTracker,
+    WandbTracker,
+    flatten_scalars,
+)
+
+__version__ = '1.2.0'
 __all__ = [
     # core
     'TrainingMonitor', 'ActivationMonitor', 'OverfitDetector',
@@ -126,5 +143,11 @@ __all__ = [
     # transformer
     'AttentionMonitor', 'ResidualStreamMonitor', 'attention_collapse_stats',
     'head_redundancy', 'positional_encoding_drift', 'tcn_receptive_field',
-    'check_layer_causal_leakage',
+    'check_layer_causal_leakage', 'capture_sdpa_attention',
+    # llm
+    'perplexity_from_loss', 'bits_per_token', 'bits_per_byte',
+    'token_throughput', 'estimate_mfu', 'gradient_noise_scale',
+    'GradientNoiseTracker',
+    # trackers
+    'TensorBoardTracker', 'WandbTracker', 'flatten_scalars',
 ]

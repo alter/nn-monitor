@@ -1,5 +1,5 @@
 @directory: libs/nn-monitor
-@updated: 2026-04-23T16:11:31Z
+@updated: 2026-05-28T00:00:00Z
 @status: in_progress
 @purpose: nn-monitor
 
@@ -21,6 +21,12 @@
   test_monitor.py::def test_grad_flow
   test_monitor.py::def test_transformer_suite
   test_monitor.py::def test_hmm_suite
+  test_monitor.py::def test_llm_metrics
+  test_monitor.py::def test_efficiency_paths
+  test_monitor.py::def test_sdpa_capture
+  test_monitor.py::def test_log_step
+  test_monitor.py::def test_flatten_scalars
+  test_monitor.py::def test_causal_aggregated_inconclusive
   test_monitor.py::def test_core_end_to_end
 
 @imports:
