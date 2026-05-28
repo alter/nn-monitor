@@ -366,6 +366,7 @@ def check_causal_leakage(
             out_pert = _forward(model, perturbed, extras)
 
             # If model returns sequence output, compare up to t_probe
+            reliable = True
             if out_orig.dim() >= 3 and out_orig.shape[-2] == L:
                 # Assume (B, L, C) or similar with seq on dim -2
                 past = out_orig[..., :t_probe + 1, :]
@@ -376,21 +377,34 @@ def check_causal_leakage(
                 past_pert = out_pert[..., :t_probe + 1]
                 max_diff = float((past - past_pert).abs().max().item())
             else:
-                # Scalar/aggregated output — compare whole
+                # Aggregated/scalar output (mean/last pooling over time): a
+                # change here is EXPECTED even for a perfectly causal model,
+                # because future tokens legitimately enter the pooled output.
+                # The probe cannot distinguish leakage from valid dependence,
+                # so don't fail on it.
                 max_diff = float((out_orig - out_pert).abs().max().item())
+                reliable = False
     finally:
         if was_training:
             model.train()
 
-    leakage = max_diff > tol
+    leakage = reliable and max_diff > tol
     result = {
         'ok': bool(not leakage),
+        'reliable': bool(reliable),
         'max_abs_diff': max_diff,
         'tolerance': tol,
         't_probe': int(t_probe),
         'sequence_length': L,
     }
-    if leakage:
+    if not reliable:
+        result['msg'] = (
+            "Output is time-aggregated; future tokens legitimately affect it. "
+            "Causal-leakage probe is inconclusive — use a seq-to-seq output or "
+            "check_layer_causal_leakage on intermediate blocks."
+        )
+        logger.info(f"Causal probe inconclusive (aggregated output, diff={max_diff:.2e})")
+    elif leakage:
         logger.warning(
             f"CAUSAL LEAKAGE: output at t<={t_probe} changed by {max_diff:.2e} "
             f"after perturbing t>{t_probe}. Model is NOT causal."

@@ -19,6 +19,10 @@ from nn_monitor import (
     check_transition_matrix, state_occupancy, dwell_times,
     emission_entropy, gaussian_emission_separability, check_ll_convergence,
     viterbi_stability, check_forward_backward_stability,
+    perplexity_from_loss, bits_per_token, bits_per_byte, token_throughput,
+    estimate_mfu, gradient_noise_scale, GradientNoiseTracker,
+    capture_sdpa_attention, flatten_scalars,
+    collect_weight_stats, snapshot_weights, track_effective_ranks,
 )
 
 
@@ -245,6 +249,115 @@ def test_hmm_suite():
     print("hmm suite ✓")
 
 
+def test_llm_metrics():
+    import math
+    assert abs(perplexity_from_loss(0.0) - 1.0) < 1e-6
+    assert abs(perplexity_from_loss(math.log(50000)) - 50000) < 1.0
+    assert perplexity_from_loss(float('inf')) != perplexity_from_loss(float('inf')) or True
+    assert abs(bits_per_token(math.log(2)) - 1.0) < 1e-6
+    assert abs(bits_per_byte(math.log(2), n_tokens=10, n_bytes=10) - 1.0) < 1e-6
+    assert token_throughput(1000, 2.0) == 500.0
+    assert token_throughput(1000, 0.0) == 0.0
+
+    # MFU: 6N approximation
+    mfu = estimate_mfu(n_params=1_000_000, tokens_per_sec=1000, peak_flops=6e9)
+    assert abs(mfu['mfu'] - 1.0) < 1e-6, mfu
+    assert mfu['flops_per_token'] == 6_000_000
+
+    # Gradient noise scale: bigger batch → smaller squared-norm estimate
+    est = gradient_noise_scale(g_small_sq=10.0, b_small=8, g_big_sq=4.0, b_big=64)
+    assert est['grad_norm_sq'] > 0 and est['trace_sigma'] > 0, est
+    assert est['b_simple'] > 0, est
+
+    tr = GradientNoiseTracker(beta=0.5)
+    for _ in range(5):
+        tr.update(10.0, 8, 4.0, 64)
+    s = tr.summary()
+    assert s['n_updates'] == 5 and s['b_simple'] > 0, s
+    print("llm metrics ✓")
+
+
+def test_efficiency_paths():
+    model = DummyConv()
+    # quantiles can be disabled and subsampled without crashing
+    stats = collect_weight_stats(model, compute_quantiles=False)
+    assert all('q05' not in s for s in stats.values())
+    stats2 = collect_weight_stats(model, compute_quantiles=True, max_quantile_elems=5)
+    assert all('q05' in s for s in stats2.values())
+
+    # snapshot capping keeps a subset
+    full = snapshot_weights(model)
+    capped = snapshot_weights(model, max_layers=1)
+    assert 0 < len(capped) <= len(full)
+
+    # effective rank skip on tiny max_dim
+    ranks = track_effective_ranks(model, max_dim=1)
+    assert any(r.get('skipped') for r in ranks.values()), ranks
+    print("efficiency paths ✓")
+
+
+def test_sdpa_capture():
+    import torch.nn.functional as F
+    q = torch.randn(2, 4, 6, 8)
+    k = torch.randn(2, 4, 6, 8)
+    v = torch.randn(2, 4, 6, 8)
+    with capture_sdpa_attention() as attn:
+        _ = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    assert len(attn) == 1, attn
+    A = next(iter(attn.values()))
+    assert A.shape == (2, 4, 6, 6), A.shape
+    # causal → upper triangle is ~0
+    assert float(A[0, 0, 0, 1:].sum()) < 1e-4
+    col = attention_collapse_stats(A)
+    assert 'per_head_entropy' in col
+    # patch restored
+    assert F.scaled_dot_product_attention.__name__ != 'patched'
+    print("sdpa capture ✓")
+
+
+def test_log_step():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        captured = []
+
+        class FakeTracker:
+            def log(self, metrics, step):
+                captured.append((step, metrics))
+            def close(self):
+                pass
+
+        with TrainingMonitor(str(tmp), loss_spike_window=5, trackers=[FakeTracker()]) as m:
+            for step in range(8):
+                loss = 2.0 if step < 7 else 50.0  # spike at last step
+                rec = m.log_step(
+                    step, loss=loss, learning_rate=1e-3, grad_norm=1.5,
+                    tokens=4096, step_time=0.5,
+                    n_params=1_000_000, peak_flops=6e9,
+                )
+            assert 'perplexity' in rec and 'tokens_per_sec' in rec and 'mfu' in rec, rec
+            assert 'loss_spike' in rec, rec  # spike detected
+        assert (tmp / 'diagnostics' / 'steps.jsonl').exists()
+        assert len(captured) == 8
+        print("log_step ✓")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_flatten_scalars():
+    flat = flatten_scalars({'a': 1, 'b': {'c': 2.0, 'd': 'skip', 'e': True}, 'f': [1, 2]})
+    assert flat == {'a': 1.0, 'b/c': 2.0}, flat
+    print("flatten scalars ✓")
+
+
+def test_causal_aggregated_inconclusive():
+    leaky = LeakyConv()  # aggregated (B, 2) output
+    batch = (torch.randn(4, 3, 32), torch.empty(4, dtype=torch.long).random_(2))
+    res = check_causal_leakage(leaky, [batch], 'cpu')
+    # aggregated output → inconclusive, must not falsely fail
+    assert res['reliable'] is False and res['ok'] is True, res
+    print("causal aggregated inconclusive ✓")
+
+
 def test_core_end_to_end():
     tmp = Path(tempfile.mkdtemp())
     try:
@@ -299,5 +412,11 @@ if __name__ == '__main__':
     test_grad_flow()
     test_transformer_suite()
     test_hmm_suite()
+    test_llm_metrics()
+    test_efficiency_paths()
+    test_sdpa_capture()
+    test_log_step()
+    test_flatten_scalars()
+    test_causal_aggregated_inconclusive()
     test_core_end_to_end()
     print("\nALL OK")

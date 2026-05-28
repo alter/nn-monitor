@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='nn-monitor',
-    version='1.0.0',
+    version='1.2.0',
     description='Neural Network Training Monitoring Framework',
     packages=find_packages(),
     python_requires='>=3.8',
@@ -13,5 +13,9 @@ setup(
     ],
     extras_require={
         'lgbm': ['lightgbm>=3.0', 'scikit-learn>=1.0'],
+        'hmm': ['hmmlearn>=0.3', 'scipy>=1.7'],
+        'trackers': ['tensorboard>=2.8'],
+        'all': ['lightgbm>=3.0', 'scikit-learn>=1.0', 'hmmlearn>=0.3',
+                'scipy>=1.7', 'tensorboard>=2.8'],
     },
 )

@@ -22,8 +22,10 @@ nn-monitor checks model health every epoch and warns about problems before they 
 | `sanity` | Pre-training checks + time-series specific: receptive field, causal leakage, time split |
 | `plots` | Reliability diagrams, gradient flow, training curves (8 panels), grad profile, attention heatmap |
 | `hmm` | Transition matrix, state occupancy, dwell times, emission entropy, LL convergence, Viterbi stability |
-| `transformer` | `AttentionMonitor`, `ResidualStreamMonitor`, head redundancy, attention collapse, TCN receptive field, per-block causal leakage |
+| `transformer` | `AttentionMonitor`, `ResidualStreamMonitor`, head redundancy, attention collapse, TCN receptive field, per-block causal leakage, SDPA/FlashAttention capture |
 | `lgbm` | LightGBM: per-iteration curves, tree structure, feature concentration, permutation vs gain disagreement, feature drift (PSI) |
+| `llm` | LM-specific: perplexity, bits-per-token / bits-per-byte, token throughput, Model FLOPs Utilization (MFU), gradient noise scale |
+| `trackers` | Optional TensorBoard / Weights & Biases sinks for live scalar streaming |
 
 ## Installation
 
@@ -92,6 +94,98 @@ with TrainingMonitor('./my_experiment', detect_anomalies=False) as monitor:
 - `training_curves.png` — **8-panel** plot: loss, val_acc, ECE, confidence gap, entropy, update ratio, GPU max memory, epoch time (data vs compute)
 - `sanity_checks.json` — pre-training check results
 - `reliability_*.png`, `update_ratios_*.png` — per epoch plots
+
+## LLM / step-based training
+
+`log_epoch` is classification-oriented (softmax probs, accuracy, ECE). LM
+pre-training is step-based and judged by token-level loss and hardware
+utilization. Use `log_step` — it does no model introspection, so it's cheap
+enough to call every optimizer step. It appends to `diagnostics/steps.jsonl`
+and streams to any attached trackers.
+
+```python
+from nn_monitor import TrainingMonitor, GradientNoiseTracker
+
+gns = GradientNoiseTracker(beta=0.98)
+
+with TrainingMonitor('./run', snapshot_max_layers=8) as monitor:
+    for step, batch in enumerate(loader):
+        loss = train_step(batch)               # mean token CE in nats
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        # gradient noise scale: small-batch vs big-batch squared grad norms
+        gns.update(g_small_sq=micro_norm**2, b_small=micro_bs,
+                   g_big_sq=grad_norm.item()**2, b_big=global_bs)
+
+        monitor.log_step(
+            step, loss=loss.item(),
+            learning_rate=sched.get_last_lr()[0],
+            grad_norm=grad_norm.item(),
+            tokens=tokens_this_step, step_time=dt,
+            n_params=n_params, peak_flops=989e12,    # H100 bf16 → MFU
+            seq_len=seq_len, n_layers=n_layers, d_model=d_model,
+            grad_noise=gns.summary(),
+        )
+```
+
+Each record carries `perplexity`, `tokens_per_sec`, `mfu`, `grad_norm`,
+`grad_noise.b_simple`, and step-level loss-spike alerts.
+
+Standalone LM metrics:
+
+```python
+from nn_monitor import (
+    perplexity_from_loss, bits_per_token, bits_per_byte,
+    token_throughput, estimate_mfu, gradient_noise_scale, GradientNoiseTracker,
+)
+
+perplexity_from_loss(loss_nats)              # exp(loss); ≈ vocab size at init
+bits_per_byte(loss_nats, n_tokens, n_bytes)  # tokenizer-independent comparison
+estimate_mfu(n_params, tokens_per_sec, peak_flops=989e12,
+             seq_len=2048, n_layers=32, d_model=4096)   # PaLM 6N + attention term
+gradient_noise_scale(g_small_sq, b_small, g_big_sq, b_big)  # McCandlish B_simple
+```
+
+## Capturing attention from FlashAttention / SDPA
+
+Fused `scaled_dot_product_attention` never materializes the attention matrix, so
+forward hooks see nothing. `capture_sdpa_attention` temporarily patches it to
+recompute softmax probabilities on the math path (diagnostic only — O(L²)
+recompute, run on a few batches):
+
+```python
+from nn_monitor import capture_sdpa_attention, attention_collapse_stats
+
+with capture_sdpa_attention(max_calls=16) as attn:
+    model(x)
+for name, A in attn.items():           # A: (B, H, L, L)
+    print(attention_collapse_stats(A))
+```
+
+## Live tracking (TensorBoard / W&B)
+
+```python
+from nn_monitor import TrainingMonitor, TensorBoardTracker, WandbTracker
+
+monitor = TrainingMonitor('./run', trackers=[
+    TensorBoardTracker('./run/tb'),
+    WandbTracker(),            # uses the active wandb.run
+])
+# every log_epoch / log_step scalar is flattened (a/b/c) and streamed.
+```
+
+## Efficiency knobs (for large models)
+
+- `TrainingMonitor(..., snapshot_max_layers=N)` — update-ratio snapshotting
+  otherwise clones every weight matrix each step (doubles param memory).
+  Caps it to an evenly-spaced subset.
+- `collect_weight_stats(model, compute_quantiles=False)` — skip the sort-heavy
+  quantile/kurtosis pass. Large tensors are auto-subsampled for quantiles
+  (also avoids `torch.quantile`'s ~2²⁴-element hard limit).
+- `track_effective_ranks(model, max_dim=4096)` — skips full SVD on projections
+  larger than `max_dim` (reported as `skipped`).
+- `monitor.capture_gradient_stats(model)` — call right after `loss.backward()`
+  so the gradient panel is reliable regardless of where you `zero_grad()`.
 
 ## Sanity checks — generic + time-series
 
@@ -308,9 +402,23 @@ spike = detect_loss_spike(loss_history, window=20, factor=3.0)
 | Residual stream log_slope > 0.5 | Exponential blow-up | LayerNorm / lower LR / deepnorm |
 | LightGBM top-5 share > 0.8 | Brittle model | More features / regularize |
 | LightGBM gain-vs-permutation ρ < 0.5 | Leakage or brittle | Investigate top gain features |
+| Perplexity ≪ vocab at step 0 | Label/shift bug (target leak) | Check next-token shift / masking |
+| MFU < 0.2 | Pipeline bound, wasting compute | Profile data loading, fuse kernels, bf16 |
+| Loss spike (step) > 3× median | Bad batch / LR / fp16 overflow | Skip batch, lower LR, checkpoint |
+| Grad noise B_simple ≫ batch size | Batch too small (noisy) | Increase batch / accumulation |
 
 ## Version
 
-Current: **1.1.0**
+Current: **1.2.0**
+
+New in 1.2.0:
+- `llm` module: perplexity, bits-per-token/byte, token throughput, MFU, gradient noise scale
+- `TrainingMonitor.log_step` — step-based logging for LLM training (`steps.jsonl`)
+- `capture_sdpa_attention` — attention capture for FlashAttention/SDPA models
+- TensorBoard / W&B tracker sinks
+- Efficiency: `snapshot_max_layers`, optional/subsampled weight quantiles, SVD skip on huge layers
+- Fixes: trend-based overfit detection, `save_summary` no longer crashes on plot failure,
+  `capture_gradient_stats` for reliable grad panel, causal-leakage probe marks aggregated
+  outputs inconclusive instead of false-failing, version/deps synced
 
 See commit history for breaking-change notes (`learning_rate` key is preserved alongside new `learning_rates` for backward compatibility).
